@@ -1,0 +1,30 @@
+# Secrets — NEVER upload these
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+lib/
+*.egg-info/
+
+# ChromaDB — large binary database, re-built on Replit via ingest.py
+chroma_db/
+
+# Eval logs — hundreds of MBs of test data, not needed for deployment
+eval_log*.jsonl
+
+# Knowledge graph — rebuilt from web searches at runtime
+knowledge_graph.json
+
+# Docs folder — PDFs go here but are too large for GitHub; upload to Replit manually
+docs/
+
+# Chainlit internals
+.chainlit/
+.files/
+
+# Misc
+graph_map.html
+project_flowchart

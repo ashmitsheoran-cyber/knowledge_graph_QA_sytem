@@ -1,0 +1,12 @@
+langgraph
+langchain-openai
+langchain-community
+langchain-text-splitters
+python-dotenv
+langchain
+chainlit
+chromadb
+sentence-transformers
+requests
+PyMuPDF
+python-docx
