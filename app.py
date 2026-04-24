@@ -1,6 +1,7 @@
 import sys
 import io
 import time
+import asyncio
 import chainlit as cl
 from agent_engine import agent_app
 
@@ -14,7 +15,6 @@ class StdoutCapture:
         sys.stdout = self._old
 
 def parse_trace(log: str) -> list:
-    """Turn raw print lines into structured node steps."""
     steps = []
     for line in log.strip().split('\n'):
         line = line.strip()
@@ -63,20 +63,15 @@ async def main(message: cl.Message):
     raw_log    = buf.getvalue()
     trace      = parse_trace(raw_log)
 
-    source    = result.get('source_type', 'Web')
-    iters     = min(result.get('iterations', 0), 3)
-    contexts  = result.get('context', [])
+    source   = result.get('source_type', 'Web')
+    iters    = min(result.get('iterations', 0), 3)
+    contexts = result.get('context', [])
 
-    # Detect hybrid: web path but local context was pre-loaded by analyst
     has_local = any("Internal:" in c or "| SOURCE:" in c for c in contexts)
     is_hybrid = (source == "Web") and has_local
 
     # ── Thought Trace — one Chainlit Step per pipeline node ──────────────────
-    node_icons   = {'Analyst': 'Analyst', 'Researcher': 'Researcher',
-                    'Writer':  'Writer',  'Judge':      'Judge'}
-    seen_nodes   = {}   # node -> step messages collected so far
-
-    # Group all messages per node in order of first appearance
+    seen_nodes    = {}
     ordered_nodes = []
     for step in trace:
         n = step['node']
@@ -86,24 +81,38 @@ async def main(message: cl.Message):
         seen_nodes[n].append(step['msg'])
 
     for node in ordered_nodes:
-        msgs     = seen_nodes[node]
-        combined = '\n'.join(msgs)
-        async with cl.Step(name=node_icons[node], type="run") as s:
+        msgs = seen_nodes[node]
+        async with cl.Step(name=node, type="run") as s:
             s.input  = query if node == 'Analyst' else msgs[0]
-            s.output = combined
+            s.output = '\n'.join(msgs)
 
     # ── Build header badge + timing ───────────────────────────────────────────
     if is_hybrid:
         badge     = "**[ HYBRID — VAULT + WEB ]**"
-        time_note = f"*Local vault + web search combined in {total_time:.1f}s*"
+        time_note = f"*Vault + web combined in {total_time:.1f}s*"
     elif source == "Local":
         badge     = "**[ LOCAL VAULT ]**"
-        time_note = f"*Answered from local memory in {total_time:.1f}s*"
+        time_note = f"*Local memory in {total_time:.1f}s*"
     else:
         attempt_str = f"{iters} search attempt{'s' if iters != 1 else ''}"
         badge       = "**[ WEB RESEARCH ]**"
-        time_note   = f"*{attempt_str} — completed in {total_time:.1f}s*"
+        time_note   = f"*{attempt_str} in {total_time:.1f}s*"
 
-    # ── Send final answer ─────────────────────────────────────────────────────
     final_answer = result.get('answer', 'No answer was generated.')
-    await cl.Message(content=f"{badge}  {time_note}\n\n---\n\n{final_answer}").send()
+
+    # ── Stream the answer token by token ─────────────────────────────────────
+    msg = cl.Message(content="")
+    await msg.send()
+
+    # Stream the header first
+    header = f"{badge}  {time_note}\n\n---\n\n"
+    await msg.stream_token(header)
+
+    # Stream the answer word by word
+    words = final_answer.split(" ")
+    for i, word in enumerate(words):
+        token = word + (" " if i < len(words) - 1 else "")
+        await msg.stream_token(token)
+        await asyncio.sleep(0.012)  # ~80 words/sec — feels natural, not too fast or slow
+
+    await msg.update()
