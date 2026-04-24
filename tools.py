@@ -194,11 +194,14 @@ def local_graph_check(user_query):
                             seen_vault.add(doc)
 
             if vault_facts:
-                # Sort by distance (best first), return top results
                 vault_facts.sort(key=lambda x: x[0])
-                return "LOCAL_FOUND", "\n".join(line for _, line in vault_facts[:12])
+                vault_lines = [line for _, line in vault_facts[:12]]
+            else:
+                vault_lines = []
         except Exception:
-            pass
+            vault_lines = []
+    else:
+        vault_lines = []
 
     phase1_facts = {}  # fact_text -> (composite_score, source)
 
@@ -248,12 +251,12 @@ def local_graph_check(user_query):
         except Exception:
             pass
 
-    # Merge: Phase 1 (ranked) first, then Phase 2 additions (by length, richest first)
-    if phase1_facts or phase2_facts:
+    # Merge all three phases: vault first (highest authority), then web cache
+    if vault_lines or phase1_facts or phase2_facts:
         p1_ranked = sorted(phase1_facts.items(), key=lambda x: x[1][0], reverse=True)
         p2_ranked = sorted(phase2_facts.items(), key=lambda x: len(x[0]), reverse=True)
 
-        context_lines = []
+        context_lines = list(vault_lines)
         for fact, (_, src) in p1_ranked[:15]:
             context_lines.append(f"FACT: {fact} | SOURCE: {src}")
         for fact, src in p2_ranked[:8]:
