@@ -13,7 +13,7 @@ def get_llm():
         model="Llama-3.3-70B-Instruct",
         api_key=token,
         base_url="https://models.inference.ai.azure.com",
-        temperature=0.1,
+        temperature=0,
         max_tokens=4096
     )
 
@@ -26,7 +26,7 @@ def get_mini_llm():
         model="gpt-4o-mini",
         api_key=token,
         base_url="https://models.inference.ai.azure.com",
-        temperature=0.1,
+        temperature=0,
         max_tokens=1024
     )
 
