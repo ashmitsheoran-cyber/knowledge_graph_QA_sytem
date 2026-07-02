@@ -64,9 +64,354 @@ def parse_trace(log: str) -> list:
             steps.append({'node': 'Judge',      'msg': line[len('[JUDGE]'):].strip()})
     return steps
 
+# ── Clickable source citations — build sidebar elements from retrieved context ──
+# Presentation-layer only: reads what the engine already returned in result['context'].
+# Never imports or alters retrieval logic. Pages absent from the context are recovered
+# read-only from ChromaDB metadata (which always carries the page).
+_MAX_SOURCES = 10
+
+def _parse_sources(contexts):
+    """Extract [{chunk, file, page}] from retrieved context. Robust to ALL engine
+    context shapes:
+      A) per-line : 'FACT: <chunk> | SOURCE: Internal: <file> (vN), Page N'
+      B) block    : 'FACT: <c1>\\n\\nFACT: <c2>\\n| SOURCE: Internal: <file>'  (one source covers all)
+      C) multi-doc: '--- <file> ---\\n<chunk>\\n\\n<chunk>'
+    Read-only — never touches retrieval."""
+    import re
+    sources, seen = [], set()
+
+    def _src_to_file_page(src):
+        src = (src or "").strip()
+        if not src.startswith("Internal:"):
+            return None, None
+        body = src.split("Internal:", 1)[1]
+        file = body.split("(v")[0].split(", Page")[0].strip().rstrip(",").strip()
+        m = re.search(r"Page\s+([0-9]+)", body)
+        return (file or None), (m.group(1) if m else None)
+
+    def _add(chunk, file, page):
+        chunk = (chunk or "").strip()
+        if not chunk or len(chunk) < 12 or not file or file == "vault_metadata":
+            return
+        key = (chunk[:120], file)
+        if key not in seen:
+            seen.add(key)
+            sources.append({"chunk": chunk, "file": file, "page": page})
+
+    for ctx in contexts or []:
+        if not ctx:
+            continue
+        if "FACT:" in ctx:
+            # Formats A & B. A trailing SOURCE covers any FACT chunks lacking their own.
+            all_src = re.findall(r"\|\s*SOURCE:\s*(Internal:[^\n]+)", ctx)
+            global_src = all_src[-1] if all_src else None
+            for seg in ctx.split("FACT:")[1:]:
+                if "| SOURCE:" in seg:
+                    chunk_part, src_part = seg.split("| SOURCE:", 1)
+                    src = src_part.split("\n", 1)[0].strip()
+                else:
+                    chunk_part, src = seg, global_src
+                file, page = _src_to_file_page(src)
+                if file:
+                    _add(chunk_part, file, page)
+        elif "---" in ctx:
+            parts = re.split(r"---\s*(.+?)\s*---", ctx)
+            i = 1
+            while i < len(parts):
+                fname = parts[i].strip()
+                body  = parts[i + 1] if i + 1 < len(parts) else ""
+                for chunk in body.split("\n\n"):
+                    _add(chunk, fname, None)
+                i += 2
+    return sources
+
+def _recover_pages(sources):
+    """Fill in any missing page by matching the chunk back to ChromaDB metadata
+    (which always has the page). Read-only — one .get() per cited file."""
+    need = {s["file"] for s in sources if s["page"] is None}
+    if not need:
+        return sources
+    try:
+        from tools import vault_collection
+    except Exception:
+        return sources
+    page_maps = {}
+    for file in need:
+        try:
+            res = vault_collection.get(
+                where={"$and": [{"file_name": {"$eq": file}}, {"is_latest": {"$eq": "true"}}]},
+                include=["documents", "metadatas"])
+            docs  = res.get("documents") or []
+            metas = res.get("metadatas") or []
+            page_maps[file] = {d.strip(): meta.get("page") for d, meta in zip(docs, metas)}
+        except Exception:
+            page_maps[file] = {}
+    for s in sources:
+        if s["page"] is None:
+            s["page"] = page_maps.get(s["file"], {}).get(s["chunk"].strip())
+    return sources
+
+def _answer_citations(answer, known_files):
+    """Parse each inline '(Source: …)' citation into {claim, file, pages}. Robust to
+    nested parens — version markers like '(v1)' and filenames containing parens
+    (e.g. 'text (1).pdf') — via paren-DEPTH span scanning. The file is matched by
+    substring against the known vault filenames (no fragile filename parsing). Page
+    numbers are read after the 'Page' keyword (so the file's own digits aren't grabbed).
+    Web/URL citations (no 'Internal:') are skipped."""
+    import re
+    answer = answer or ""
+    # 1) Find balanced "(Source: … )" spans, counting paren depth so an inner ")" from
+    #    "(v1)" or a filename doesn't end the span early.
+    spans, i = [], 0
+    while True:
+        s = answer.find("(Source:", i)
+        if s < 0:
+            break
+        depth, j = 0, s
+        while j < len(answer):
+            if answer[j] == "(":
+                depth += 1
+            elif answer[j] == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        e = j if j < len(answer) else len(answer) - 1
+        spans.append((s, e))
+        i = e + 1
+    # 2) Parse each span.
+    kf = sorted([k for k in (known_files or []) if k], key=len, reverse=True)  # longest first
+    out, prev = [], 0
+    for (s, e) in spans:
+        claim = re.sub(r"\s+", " ", answer[prev:s]).strip(" -*•\t")
+        prev  = e + 1
+        cit   = answer[s:e + 1]
+        if "Internal:" not in cit:
+            continue                                   # web/URL citation — skip
+        file = next((f for f in kf if f in cit), "")
+        pm   = re.search(r"\bPages?\b", cit)
+        pages = re.findall(r"\d+", cit[pm.end():]) if pm else []   # page nums come AFTER 'Page'
+        if file:
+            out.append({"claim": claim, "file": file, "pages": pages})
+    return out
+
+def build_source_actions(contexts, answer):
+    """Build click-to-open source buttons (cl.Action) — ONE per inline citation.
+    If a citation names pages, the button opens one chunk PER cited page (fetched
+    read-only from ChromaDB); a page-less citation opens the single best-matching
+    chunk. Actions (not side elements) → nothing auto-opens; the sidebar opens only
+    on click via 'view_source'. Engine untouched; fully guarded."""
+    import numpy as np
+    pool      = _parse_sources(contexts)        # retrieved pool (also the known-file list)
+    citations = _answer_citations(answer, {s["file"] for s in pool})
+    if not citations and not pool:
+        return []
+    try:
+        from tools import embedding_model as emb, vault_collection
+    except Exception:
+        emb, vault_collection = None, None
+
+    # Preload each cited file's latest chunks once: file -> {page -> [chunks]} and all chunks.
+    page_maps, all_chunks = {}, {}
+    for f in {c["file"] for c in citations if c.get("file")}:
+        pm, allc = {}, []
+        if vault_collection is not None:
+            try:
+                res = vault_collection.get(
+                    where={"$and": [{"file_name": {"$eq": f}}, {"is_latest": {"$eq": "true"}}]},
+                    include=["documents", "metadatas"])
+                for d, mt in zip(res.get("documents") or [], res.get("metadatas") or []):
+                    pm.setdefault(mt.get("page"), []).append(d)
+                    allc.append(d)
+            except Exception:
+                pass
+        page_maps[f], all_chunks[f] = pm, allc
+
+    def _best(chunks, claim):
+        chunks = [c for c in chunks if c]
+        if not chunks:
+            return None
+        if len(chunks) == 1 or emb is None or not claim:
+            return chunks[0]
+        ce = np.array(emb.encode(chunks)); q = emb.encode([claim])[0]
+        sims = (ce @ q) / (np.linalg.norm(ce, axis=1) * (np.linalg.norm(q) + 1e-9) + 1e-9)
+        return chunks[int(np.argmax(sims))]
+
+    actions = []
+    if citations:
+        for i, c in enumerate(citations, 1):
+            f, claim, pages = c["file"], c.get("claim", ""), c.get("pages") or []
+            pm = page_maps.get(f, {})
+            items, seen = [], set()
+            for pg in pages:                                  # one chunk per cited page
+                try:    cand = pm.get(int(pg)) or []
+                except Exception: cand = []
+                ch = _best(cand, claim)
+                if ch and ch[:120] not in seen:
+                    seen.add(ch[:120]); items.append({"page": str(pg), "chunk": ch})
+            if not items:                                     # page-less citation → single best chunk
+                src_pool = [s["chunk"] for s in pool if s["file"] == f] \
+                           or all_chunks.get(f) or [s["chunk"] for s in pool]
+                ch = _best(src_pool, claim)
+                if ch:
+                    pg = next((str(p) for p, cl in pm.items() if ch in cl), "")
+                    items.append({"page": pg, "chunk": ch})
+            if not items:
+                continue
+            pages_lbl = ", ".join(it["page"] for it in items if it["page"])
+            if len(items) > 1 and pages_lbl:   suffix = f" (pp. {pages_lbl})"
+            elif items[0]["page"]:             suffix = f" (p.{items[0]['page']})"
+            else:                              suffix = ""
+            actions.append(cl.Action(
+                name="view_source",
+                payload={"file": f, "items": items},
+                label=f"📄 Source {i} · {f}{suffix}",
+                tooltip="View the exact passage(s) this answer drew from",
+            ))
+    else:
+        # No inline citations at all → top chunks vs the whole answer (graceful fallback).
+        ranked = pool
+        if emb is not None and answer and pool:
+            ce = np.array(emb.encode([s["chunk"] for s in pool])); q = emb.encode([answer[:1000]])[0]
+            sims = (ce @ q) / (np.linalg.norm(ce, axis=1) * (np.linalg.norm(q) + 1e-9) + 1e-9)
+            ranked = [pool[k] for k in np.argsort(-sims)]
+        for i, s in enumerate(_recover_pages(ranked[:3]), 1):
+            pg = str(s["page"]) if s.get("page") not in (None, "", "?") else ""
+            actions.append(cl.Action(
+                name="view_source",
+                payload={"file": s["file"], "items": [{"page": pg, "chunk": s["chunk"]}]},
+                label=f"📄 Source {i} · {s['file']}" + (f" (p.{pg})" if pg else ""),
+                tooltip="View the passage this answer drew from",
+            ))
+    return actions[:_MAX_SOURCES]
+
+
+_PDF_HL_DIR = "_pdf_highlights"   # runtime cache of highlighted PDFs (safe to delete)
+
+def _mark_chunk(pg, chunk):
+    """Highlight a chunk's CONTIGUOUS text on a page as clean, readable bands.
+    Aligns the chunk against the page's real word stream (no scattered gaps),
+    unions the matched words per line, and uses light opacity so the text under
+    the highlight stays readable. Falls back to phrase search if alignment fails."""
+    import re, collections, fitz
+    norm   = lambda w: re.sub(r"[^a-z0-9]", "", w.lower())
+    pwords = pg.get_text("words")                         # (x0,y0,x1,y1, word, block, line, wno)
+    if not pwords or not chunk:
+        return False
+    pnorm = [norm(w[4]) for w in pwords]
+    cnorm = [t for t in (norm(w) for w in chunk.split()) if t]
+    if not cnorm:
+        return False
+    # Locate the chunk's start in the page's word stream (anchor on first 5 tokens).
+    anchor, start = cnorm[:5], -1
+    for i in range(len(pnorm) - len(anchor) + 1):
+        if pnorm[i:i + len(anchor)] == anchor:
+            start = i
+            break
+    if start < 0:                                         # anchor failed → first distinctive token
+        distinctive = next((t for t in cnorm if len(t) >= 7), None)
+        if distinctive and distinctive in pnorm:
+            start = pnorm.index(distinctive)
+    if start >= 0:
+        span  = pwords[start:min(start + len(cnorm), len(pwords))]
+        lines = collections.OrderedDict()
+        for w in span:                                    # union the matched words per text line
+            key = (w[5], w[6])
+            r   = fitz.Rect(w[:4])
+            lines[key] = (lines[key] | r) if key in lines else r
+        for r in lines.values():
+            a = pg.add_highlight_annot(r)
+            a.set_opacity(0.40)                           # light → text stays readable
+            a.update()
+        return True
+    # Fallback: light phrase-window highlights (still readable, even if less contiguous).
+    ws, done = chunk.split(), False
+    for k in range(0, max(1, len(ws) - 5), 6):
+        for r in pg.search_for(" ".join(ws[k:k + 6])):
+            a = pg.add_highlight_annot(r); a.set_opacity(0.40); a.update(); done = True
+    return done
+
+def _highlighted_pdf(file, items):
+    """Return (full_pdf_path, first_page): the WHOLE document with the cited chunk(s)
+    highlighted CLEANLY on their page(s). The highlight is RASTERIZED into the cited
+    page (rendered to an image and laid back in) so it shows exactly like the readable
+    image — never patchy in the PDF viewer. Other pages stay original. One navigable
+    file. None if no source PDF on disk."""
+    src = os.path.join("docs", file)
+    if not os.path.exists(src):
+        return None
+    try:
+        import fitz, hashlib
+        by_page = {}
+        for it in items:
+            ps = str(it.get("page", ""))
+            if ps.isdigit():
+                by_page.setdefault(int(ps), []).append(it.get("chunk", "") or "")
+        if not by_page:
+            return None
+        os.makedirs(_PDF_HL_DIR, exist_ok=True)
+        pages = sorted(by_page)
+        key   = hashlib.md5(f"{file}|{[(p, by_page[p]) for p in pages]}|v5".encode()).hexdigest()[:12]
+        out   = os.path.join(_PDF_HL_DIR, f"{key}.pdf")
+        if not os.path.exists(out):
+            doc = fitz.open(src)
+            for p in pages:
+                if p < 1 or p > len(doc):
+                    continue
+                pg = doc[p - 1]                              # metadata page is 1-indexed
+                for chunk in by_page[p]:
+                    _mark_chunk(pg, chunk)                   # clean per-line highlight annots
+                pix = pg.get_pixmap(dpi=150)                 # render page INCLUDING the highlight
+                for a in list(pg.annots() or []):           # drop annots so they don't double-draw
+                    pg.delete_annot(a)
+                pg.insert_image(pg.rect, pixmap=pix, overlay=True)   # lay the clean render back in
+            doc.save(out)
+            doc.close()
+        return out, pages[0]
+    except Exception as e:
+        print(f"[UI] highlighted pdf failed for '{file}' (falling back to text): {e}")
+        return None
+
+
+@cl.action_callback("view_source")
+async def _on_view_source(action: cl.Action):
+    """Open the cited source in the side panel — fires ONLY on click (no auto-open).
+    Preferred: the REAL PDF, opened at the chunk's page with the passage highlighted.
+    Fallback (no PDF on disk): the chunk text, one passage per cited page."""
+    p     = action.payload or {}
+    file  = p.get("file", "Source")
+    items = p.get("items") or []
+    if not items and "chunk" in p:                       # backward-compat with old payload
+        items = [{"page": p.get("page", ""), "chunk": p.get("chunk", "")}]
+
+    # ── Preferred path: ONE full document, cited chunk(s) cleanly highlighted ──
+    res = _highlighted_pdf(file, items)
+    if res:
+        pdf_path, first_page = res
+        await cl.ElementSidebar.set_title(f"{file} · p.{first_page}")
+        await cl.ElementSidebar.set_elements([
+            cl.Pdf(name=file, path=pdf_path, page=first_page, display="side")
+        ])
+        return
+
+    # ── Fallback: text passages (docs whose PDF isn't on disk) ──
+    elements, pages = [], []
+    for j, it in enumerate(items, 1):
+        pg    = it.get("page", "")
+        chunk = it.get("chunk", "")
+        head  = f"**{file}**" + (f" — Page {pg}" if pg else "")
+        elements.append(cl.Text(name=f"passage_{j}", content=f"{head}\n\n---\n\n{chunk}", display="side"))
+        if pg:
+            pages.append(pg)
+    title = file + (f" · pp. {', '.join(pages)}" if len(pages) > 1 else (f" · p.{pages[0]}" if pages else ""))
+    await cl.ElementSidebar.set_title(title)
+    await cl.ElementSidebar.set_elements(elements)
+
 # ── Welcome screen ────────────────────────────────────────────────────────────
 @cl.on_chat_start
 async def on_chat_start():
+    import shutil
+    shutil.rmtree(_PDF_HL_DIR, ignore_errors=True)   # clear stale highlighted-PDF cache
     await cl.Message(content=(
         "## Strategic Intelligence Assistant\n\n"
         "I combine your **private document vault** with **live web search** "
@@ -419,5 +764,15 @@ async def main(message: cl.Message):
         token = word + (" " if i < len(words) - 1 else "")
         await msg.stream_token(token)
         await asyncio.sleep(0.012)
+
+    # ── Clickable source citations — open the exact retrieved chunk in a sidebar ──
+    # Additive + fully guarded: if anything here fails, the answer still renders.
+    try:
+        src_actions = build_source_actions(contexts, final_answer)
+        if src_actions:
+            await msg.stream_token("\n\n---\n\n*📎 Sources — click a button below to view the exact passage:*")
+            msg.actions = src_actions
+    except Exception as _src_e:
+        print(f"[UI] Source citation build failed (answer unaffected): {_src_e}")
 
     await msg.update()
