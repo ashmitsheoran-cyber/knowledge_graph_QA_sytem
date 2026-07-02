@@ -1409,7 +1409,23 @@ def synthesize_node(state: AgentState):
                 # semantic matches. Keeps both columns concrete and symmetric.
                 _cap = max(6, 24 // _n_docs)
                 _pos = chunks[:max(4, _cap // 2)]
-                _sem = search_top_chunks(_disc_q, doc_name, n=_cap)
+                # The raw comparison question ranks figure-bearing chunks too low
+                # (proven: misses 2.0T / 4096 / 128k-vocab) -> writer says "Not specified"
+                # or fabricates. Augment with a generic spec-seeking query; interleave so
+                # neither intent is starved; then merge/cap EXACTLY as before (same count).
+                from itertools import zip_longest
+                _SPEC_MAGNET = (
+                    "model parameters number of tokens trained context length "
+                    "sequence length vocabulary size tokenizer architecture"
+                )
+                _sem_q   = search_top_chunks(_disc_q, doc_name, n=_cap)
+                _sem_mag = search_top_chunks(_SPEC_MAGNET, doc_name, n=_cap)
+                _sem, _sem_seen = [], set()
+                for _a, _b in zip_longest(_sem_q, _sem_mag):
+                    for _x in (_a, _b):
+                        if _x is not None and _x not in _sem_seen:
+                            _sem_seen.add(_x)
+                            _sem.append(_x)
                 _seen, _merged = set(), []
                 for _c in (_pos + _sem):
                     if _c not in _seen:
@@ -1653,6 +1669,9 @@ def writer_node(state: AgentState):
                 "'Better', 'Larger', or 'Not explicitly stated'. If you cannot find a concrete value for one "
                 "entity on a given attribute, DROP that entire row rather than padding it with a vague placeholder "
                 "— keep only attributes where BOTH entities have real data. "
+                "GROUNDING: every figure you write MUST appear verbatim in that entity's own provided excerpts — "
+                "never supply a number from your own training knowledge; if a value is not in the excerpts, treat "
+                "it as absent (and drop the row per the rule above rather than inventing or approximating it). "
                 "After the final table row, leave a BLANK LINE, then write a one-sentence verdict followed by your "
                 "synthesis as ordinary paragraphs. The verdict and synthesis must NEVER appear inside the table or "
                 "as a table row — no pipes, no empty cells, plain prose only."
