@@ -1,4 +1,5 @@
 import os
+import json
 import uuid
 import numpy as np
 from datetime import datetime
@@ -13,6 +14,7 @@ doc_index_collection = chroma_client.get_or_create_collection(name="doc_index")
 embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
 
 DOCS_DIR = "./docs"
+GRAPH_FILE = "knowledge_graph.json"   # mirrored vault chunks for the KG retrieval phase (Phase 1)
 
 
 def extract_text_from_pdf(file_path):
@@ -103,6 +105,43 @@ def _update_doc_index(file_name: str):
         print(f"[INGEST] Doc index updated: '{file_name}' ({len(embeddings)} chunks)")
     except Exception as e:
         print(f"[INGEST] Doc index update failed for '{file_name}': {e}")
+
+
+def upsert_doc_to_graph(file_name: str) -> int:
+    """Mirror a document's current (is_latest) chunks into knowledge_graph.json as a
+    SINGLE entry {source: "Internal: <file>", data: [chunks]} — NO timestamp (ChromaDB
+    owns time). Lets the KG retrieval phase (local_graph_check Phase 1) surface vault
+    facts by exact keyword. Idempotent: replaces THIS file's entry, preserves every other
+    entry (other docs AND web-cache facts). Read-only on ChromaDB."""
+    try:
+        res = vault_collection.get(
+            where={"$and": [{"file_name": {"$eq": file_name}}, {"is_latest": {"$eq": "true"}}]},
+            include=["documents"]
+        )
+        seen, data = set(), []
+        for d in (res.get("documents") or []):
+            c = (d or "").strip()
+            if len(c) >= 12 and c not in seen:
+                seen.add(c)
+                data.append(c)
+        if not data:
+            return 0
+        graph = []
+        if os.path.exists(GRAPH_FILE):
+            try:
+                with open(GRAPH_FILE, "r", encoding="utf-8") as f:
+                    graph = json.load(f)
+            except Exception:
+                graph = []
+        src = f"Internal: {file_name}"
+        graph = [e for e in graph if e.get("source") != src]   # drop this file's old entry
+        graph.append({"source": src, "data": data})            # ...and re-add the latest chunks
+        with open(GRAPH_FILE, "w", encoding="utf-8") as f:
+            json.dump(graph, f, indent=2, ensure_ascii=False)
+        return len(data)
+    except Exception as e:
+        print(f"[INGEST] KG mirror failed for '{file_name}': {e}")
+        return 0
 
 
 def check_similarity_before_ingest(file_path: str, file_name: str, threshold: float = 0.85):
@@ -263,6 +302,7 @@ def ingest_file(file_path: str, file_name: str) -> int:
         print(f"[INGEST] '{file_name}' {v_label} — {len(new_docs)} chunks added.")
 
     _update_doc_index(file_name)
+    upsert_doc_to_graph(file_name)   # mirror latest chunks into the KG (Phase 1 retrieval)
     return len(new_docs)
 
 
