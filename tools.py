@@ -991,9 +991,21 @@ def local_graph_check(user_query, doc_filter=None, version_pref=None):
         p2_ranked = sorted(phase2_facts.items(), key=lambda x: len(x[0]), reverse=True)
 
         context_lines = list(vault_lines)
+        # Dedup: vault chunks now also live in the KG (Phase 1) after the backfill, so the
+        # same chunk can surface from both the vault (Phase 0) and the graph. Keep the vault
+        # copy — it carries the page — and skip identical repeats. Literal-dup removal only;
+        # ranking and selection are unchanged.
+        _vault_texts = {
+            _l.split("FACT: ", 1)[1].split(" | SOURCE:", 1)[0]
+            for _l in vault_lines if _l.startswith("FACT: ") and " | SOURCE:" in _l
+        }
         for fact, (_, src) in p1_ranked[:15]:
+            if fact in _vault_texts:
+                continue
             context_lines.append(f"FACT: {fact} | SOURCE: {src}")
         for fact, src in p2_ranked[:8]:
+            if fact in _vault_texts:
+                continue
             context_lines.append(f"FACT: {fact} | SOURCE: {src}")
 
         return "LOCAL_FOUND", "\n".join(context_lines)
